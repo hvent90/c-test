@@ -13,6 +13,29 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 
+typedef enum {
+    COLOR_PALETTE_0,
+    COLOR_PALETTE_1,
+    COLOR_PALETTE_2,
+    COLOR_PALETTE_3,
+    COLOR_PALETTE_4,
+    COLOR_PALETTE_5,
+    COLOR_PALETTE_6,
+    COLOR_PALETTE_7,
+    COLOR_PALETTE_8,
+    COLOR_PALETTE_9,
+    COLOR_PALETTE_10,
+    COLOR_PALETTE_11,
+    COLOR_PALETTE_12,
+    COLOR_PALETTE_13,
+    COLOR_PALETTE_14,
+    COLOR_PALETTE_15,
+    COLOR_BACKGROUND,
+    COLOR_FOREGROUND,
+    COLOR_CURSOR,
+    COLOR_SELECTION
+} ThemeColor;
+
 // ECS
 typedef struct {
 	float health;
@@ -37,7 +60,7 @@ ECS_COMPONENT_DECLARE(EnemyInput);
 typedef struct {
 	Vector2 position;
 	float radius;
-	Color color;
+	ThemeColor colorIndex;
 } Renderable;
 ECS_COMPONENT_DECLARE(Renderable);
 
@@ -57,7 +80,7 @@ typedef struct {
 	float velocity;
 	float damping;
 	float stiffness;
-	Color color;
+	ThemeColor colorIndex;
 	bool active;
 	bool wasActive;
 } AttractionRangeVFX;
@@ -74,11 +97,15 @@ typedef struct {
 } Theme;
 
 Color HexToColor(const char *hex) {
-	if (hex[0] != '#') return BLACK;
-
 	int r, g, b;
-	if (sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b) == 3) {
-		return (Color){r, g, b, 255};
+	if (hex[0] == '#') {
+		if (sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b) == 3) {
+			return (Color){r, g, b, 255};
+		}
+	} else {
+		if (sscanf(hex, "%02x%02x%02x", &r, &g, &b) == 3) {
+			return (Color){r, g, b, 255};
+		}
 	}
 
 	return BLACK;
@@ -296,9 +323,24 @@ void PositionUpdateSystem(ecs_iter_t *it) {
 
 void RenderSystem(ecs_iter_t *it) {
 	const Renderable *r = ecs_field(it, Renderable, 0);
+	Theme *theme = &themes[currentThemeIndex];
 
 	for (int i = 0; i < it->count; i++) {
-		DrawCircleV(r[i].position, r[i].radius, r[i].color);
+		Color color;
+		switch (r[i].colorIndex) {
+			case COLOR_BACKGROUND: color = theme->background; break;
+			case COLOR_FOREGROUND: color = theme->foreground; break;
+			case COLOR_CURSOR: color = theme->cursor_color; break;
+			case COLOR_SELECTION: color = theme->selection_background; break;
+			default:
+				if (r[i].colorIndex >= COLOR_PALETTE_0 && r[i].colorIndex <= COLOR_PALETTE_15) {
+					color = theme->palette[r[i].colorIndex];
+				} else {
+					color = WHITE;
+				}
+				break;
+		}
+		DrawCircleV(r[i].position, r[i].radius, color);
 	}
 }
 
@@ -328,6 +370,7 @@ void SpringAnimationSystem(ecs_iter_t *it) {
 void AttractionRangeVFXSystem(ecs_iter_t *it) {
 	AttractionRangeVFX *vfx = ecs_field(it, AttractionRangeVFX, 0);
 	const Renderable *renderable = ecs_field(it, Renderable, 1);
+	Theme *theme = &themes[currentThemeIndex];
 	
 	for (int i = 0; i < it->count; i++) {
 		bool isSpacePressed = IsKeyDown(KEY_SPACE);
@@ -354,7 +397,20 @@ void AttractionRangeVFXSystem(ecs_iter_t *it) {
 			
 			// Draw attraction range circle with transparency
 			if (vfx[i].currentRange > 0.1f) {
-				Color vfxColor = vfx[i].color;
+				Color vfxColor;
+				switch (vfx[i].colorIndex) {
+					case COLOR_BACKGROUND: vfxColor = theme->background; break;
+					case COLOR_FOREGROUND: vfxColor = theme->foreground; break;
+					case COLOR_CURSOR: vfxColor = theme->cursor_color; break;
+					case COLOR_SELECTION: vfxColor = theme->selection_background; break;
+					default:
+						if (vfx[i].colorIndex >= COLOR_PALETTE_0 && vfx[i].colorIndex <= COLOR_PALETTE_15) {
+							vfxColor = theme->palette[vfx[i].colorIndex];
+						} else {
+							vfxColor = WHITE;
+						}
+						break;
+				}
 				vfxColor.a = 50; // Set transparency
 				DrawCircleLines(renderable[i].position.x, renderable[i].position.y, vfx[i].currentRange, vfxColor);
 				
@@ -402,7 +458,7 @@ void SpawnEnemy(ecs_world_t *world, Vector2 position) {
 	const float targetRadius = 15;
 	
 	ecs_set(world, enemy, Health, {.health = 100});
-	ecs_set(world, enemy, Renderable, {.position = position, .radius = targetRadius * 0.3f, .color = GREEN});
+	ecs_set(world, enemy, Renderable, {.position = position, .radius = targetRadius * 0.3f, .colorIndex = COLOR_PALETTE_2});
 	ecs_set(world, enemy, Velocity, {.velocity ={0, 0}});
 	ecs_set(world, enemy, EnemyInput, {.directionSet = false});
 	ecs_set(world, enemy, SpringAnimation, {
@@ -469,7 +525,7 @@ int main(void) {
 	ecs_entity_t player = ecs_new(world);
 	ecs_set_name(world, player, "Player");
 	ecs_set(world, player, Health, {.health = 100});
-	ecs_set(world, player, Renderable, {.position = {400, 225}, .radius = 20, .color = RED});
+	ecs_set(world, player, Renderable, {.position = {400, 225}, .radius = 20, .colorIndex = COLOR_FOREGROUND});
 	ecs_set(world, player, Velocity, {.velocity ={0, 0}});
 	ecs_set(world, player, PlayerInput, {});
 	ecs_set(world, player, AttractionRangeVFX, {
@@ -479,7 +535,7 @@ int main(void) {
 		.velocity = 0,
 		.damping = 0.95f,
 		.stiffness = 0.01f,
-		.color = BLUE,
+		.colorIndex = COLOR_PALETTE_4,
 		.active = true,
 		.wasActive = false
 	});
