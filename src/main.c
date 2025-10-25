@@ -86,6 +86,16 @@ typedef struct {
 } AttractionRangeVFX;
 ECS_COMPONENT_DECLARE(AttractionRangeVFX);
 
+typedef struct {
+	bool unused;
+} Spike;
+ECS_COMPONENT_DECLARE(Spike);
+
+typedef struct {
+	bool unused;
+} Mortal;
+ECS_COMPONENT_DECLARE(Mortal);
+
 // UI
 typedef struct {
 	char name[64];
@@ -235,12 +245,27 @@ int ScanThemeDirectory(const char *dirPath, Theme *themes, int maxThemes) {
 	return themeCount;
 }
 
+void TriggerDestruction(ecs_world_t *world, ecs_entity_t entity) {
+	// Add spring animation to shrink the entity to 0
+	const Renderable *r = ecs_get(world, entity, Renderable);
+	if (r) {
+		ecs_set(world, entity, SpringAnimation, {
+			.currentRadius = r->radius,
+			.targetRadius = 0,
+			.velocity = 0,
+			.damping = 0.0001f,
+			.stiffness = 1000.0f
+		});
+	}
+
+	// PlayDesctructionSound();
+}
+
 void PlayerMovementSystem(ecs_iter_t *it) {
 	Velocity *v = ecs_field(it, Velocity, 0);
 
-	const float PLAYER_SPEED = 200.0f * GetFrameTime();
-
 	for (int i = 0; i < it->count; i++) {
+		const float PLAYER_SPEED = 200.0f;
 		v[i].velocity = (Vector2){0, 0};
 
 		if (IsKeyDown(KEY_RIGHT)) v[i].velocity.x = PLAYER_SPEED;
@@ -261,11 +286,10 @@ void EnemyMovementSystem(ecs_iter_t *it) {
 	const Renderable *playerRenderable = ecs_get_id(world, player, renderable_id);
 	const Vector2 playerPos = playerRenderable->position;
 
-	const float ENEMY_SPEED = 100.0f * GetFrameTime();
-	const float MAX_ATTRACTION_FORCE = 5.0f * GetFrameTime();
 	const float MAX_ATTRACTION_RANGE = (float)MIN(GetScreenWidth(), GetScreenHeight()) / 2;
 
 	for (int i = 0; i < it->count; i++) {
+		const float ENEMY_SPEED = 100.0f;
 		if (!e[i].directionSet && ENEMY_SPEED > 0) {
 			e[i].directionSet = true;
 			v[i].velocity = (Vector2){
@@ -275,6 +299,7 @@ void EnemyMovementSystem(ecs_iter_t *it) {
 		}
 
 		if (IsKeyDown(KEY_SPACE)) {
+			const float MAX_ATTRACTION_FORCE = 5.0f;
 			Vector2 dir = {
 				.x = playerPos.x - r[i].position.x,
 				.y = playerPos.y - r[i].position.y
@@ -304,8 +329,99 @@ void PositionUpdateSystem(ecs_iter_t *it) {
 	const int screenHeight = GetScreenHeight();
 
 	for (int i = 0; i < it->count; i++) {
-		r[i].position.x += v[i].velocity.x;
-		r[i].position.y += v[i].velocity.y;
+		r[i].position.x += v[i].velocity.x * GetFrameTime();
+		r[i].position.y += v[i].velocity.y * GetFrameTime();
+
+		for (int j = 0; j < it->count; j++) {
+			if (i == j) {
+				continue;
+			}
+
+			Vector2 dir = {
+				.x = r[j].position.x - r[i].position.x,
+				.y = r[j].position.y - r[i].position.y
+			};
+
+			const float magnitude = sqrtf(dir.x * dir.x + dir.y * dir.y);
+			const float boundary = r[j].radius + r[i].radius;
+			if (magnitude > boundary) {
+				continue;
+			}
+
+			// Check for Spike
+			const Spike *spike_i = ecs_get(it->world, it->entities[i], Spike);
+			const Spike *spike_j = ecs_get(it->world, it->entities[j], Spike);
+			const Mortal *mortal_i = ecs_get(it->world, it->entities[i], Mortal);
+			const Mortal *mortal_j = ecs_get(it->world, it->entities[j], Mortal);
+
+			// DEBUG: Print collision info
+			if (spike_i || spike_j || mortal_i || mortal_j) {
+				printf("Collision detected! i=%llu j=%llu spike_i=%p spike_j=%p mortal_i=%p mortal_j=%p\n",
+					   it->entities[i], it->entities[j],
+					   (void*)spike_i, (void*)spike_j, (void*)mortal_i, (void*)mortal_j);
+			}
+
+			// Destroy both
+			if (spike_i && mortal_i && spike_j && mortal_j) {
+				printf("Destroying both entities\n");
+				TriggerDestruction(it->world, it->entities[i]);
+				TriggerDestruction(it->world, it->entities[j]);
+				continue;
+			}
+
+			if (spike_i && mortal_j) {
+				printf("Destroying mortal entity (j)\n");
+				TriggerDestruction(it->world, it->entities[j]);
+				continue;
+			}
+
+			if (spike_j && mortal_i) {
+				printf("Destroying mortal entity (i)\n");
+				TriggerDestruction(it->world, it->entities[i]);
+				continue;
+			}
+
+			// Normalize direction
+			if (magnitude > 0) {
+				dir.x /= magnitude;
+				dir.y /= magnitude;
+			}
+
+			// Adjust positions
+			const float adjustment = (boundary - magnitude) * 0.5f;
+			r[i].position.x -= dir.x * adjustment;
+			r[i].position.y -= dir.y * adjustment;
+			r[j].position.x += dir.x * adjustment;
+			r[j].position.y += dir.y * adjustment;
+
+			// Adjust velocity
+
+			// Calculate relative velocity
+			Vector2 relativeVelocity = {
+				v[j].velocity.x - v[i].velocity.x,
+				v[j].velocity.y - v[i].velocity.y
+			};
+
+			// Calculate velocity along the collision normal (dir)
+			float velocityAlongNormal = relativeVelocity.x * dir.x + relativeVelocity.y * dir.y;
+
+			// Only resolve if entities are moving toward each other
+			if (velocityAlongNormal > 0) {
+				// Restitution (bounciness): 0 = no bounce, 1 = perfect bounce
+				const float restitution = 1.0f;
+
+				// Calculate impulse scalar
+				float impulseMagnitude = -(1 + restitution) * velocityAlongNormal;
+				impulseMagnitude *= 0.5f; // Divide by 2 because both entities have equal "mass"
+
+				// Apply impulse to both entities
+				v[i].velocity.x -= dir.x * impulseMagnitude;
+				v[i].velocity.y -= dir.y * impulseMagnitude;
+
+				v[j].velocity.x += dir.x * impulseMagnitude;
+				v[j].velocity.y += dir.y * impulseMagnitude;
+			}
+		}
 
 		if (r[i].position.x < r[i].radius || (int) r[i].position.x > screenWidth - (int)r[i].radius) {
 			v[i].velocity.x *= -1;
@@ -351,9 +467,9 @@ void SpringAnimationSystem(ecs_iter_t *it) {
 	for (int i = 0; i < it->count; i++) {
 		// Spring physics
 		float force = (spring[i].targetRadius - spring[i].currentRadius) * spring[i].stiffness;
-		spring[i].velocity += force;
-		spring[i].velocity *= spring[i].damping;
-		spring[i].currentRadius += spring[i].velocity;
+		spring[i].velocity += force * GetFrameTime();
+		spring[i].velocity *= powf(spring[i].damping, GetFrameTime());
+		spring[i].currentRadius += spring[i].velocity * GetFrameTime();
 		
 		// Update renderable radius
 		renderable[i].radius = spring[i].currentRadius;
@@ -362,7 +478,12 @@ void SpringAnimationSystem(ecs_iter_t *it) {
 		if (fabsf(spring[i].currentRadius - spring[i].targetRadius) < 0.1f && 
 			fabsf(spring[i].velocity) < 0.1f) {
 			renderable[i].radius = spring[i].targetRadius;
-			ecs_remove_id(it->world, it->entities[i], ecs_id(SpringAnimation));
+
+			if (spring[i].targetRadius <= 0.0f) {
+				ecs_delete(it->world, it->entities[i]);
+			} else {
+				ecs_remove_id(it->world, it->entities[i], ecs_id(SpringAnimation));
+			}
 		}
 	}
 }
@@ -424,7 +545,7 @@ void AttractionRangeVFXSystem(ecs_iter_t *it) {
 	}
 }
 
-void DrawUI() {
+void DrawUI(ecs_world_t *world) {
 	Theme *theme = &themes[currentThemeIndex];
 
 	const int fontSize = 20;
@@ -433,6 +554,11 @@ void DrawUI() {
 
 	// Draw title
 	DrawText(theme->name, margin, y, fontSize, theme->foreground);
+
+	// Enemy count
+	int enemyCount = ecs_count(world, EnemyInput);
+	const char *enemyText = TextFormat("%d", enemyCount);
+	DrawText(enemyText, margin, y + 20, fontSize, theme->foreground);
 
 	// Draw FPS
 	static int fps = 0;
@@ -465,9 +591,10 @@ void SpawnEnemy(ecs_world_t *world, Vector2 position) {
 		.currentRadius = targetRadius * 0.3f,
 		.targetRadius = targetRadius,
 		.velocity = 0,
-		.damping = 0.8f,
-		.stiffness = 0.2f
+		.damping = 0.00001f,
+		.stiffness = 700.0f
 	});
+	ecs_set(world, enemy, Mortal, {});
 
 	PlayEnemySpawnSound();
 }
@@ -489,7 +616,7 @@ void HandleInput(ecs_world_t *world) {
 int main(void) {
 	SetConfigFlags(FLAG_WINDOW_HIGHDPI); // Enable high DPI support
 	InitWindow(800, 450, "raylib window");
-	SetTargetFPS(60);
+	SetTargetFPS(120);
 	InitAudio();
 
 	// Setup themes
@@ -514,6 +641,8 @@ int main(void) {
 	ECS_COMPONENT_DEFINE(world, Renderable);
 	ECS_COMPONENT_DEFINE(world, SpringAnimation);
 	ECS_COMPONENT_DEFINE(world, AttractionRangeVFX);
+	ECS_COMPONENT_DEFINE(world, Spike);
+	ECS_COMPONENT_DEFINE(world, Mortal);
 
 	ECS_SYSTEM(world, PlayerMovementSystem, EcsOnUpdate, Velocity, PlayerInput);
 	ECS_SYSTEM(world, EnemyMovementSystem, EcsOnUpdate, Velocity, EnemyInput, Renderable);
@@ -523,7 +652,7 @@ int main(void) {
 	ECS_SYSTEM(world, AttractionRangeVFXSystem, EcsOnUpdate, AttractionRangeVFX, Renderable);
 
 	ecs_entity_t player = ecs_new(world);
-	ecs_set_name(world, player, "Player");
+	ecs_set_name(world, player, "Player"); // {}
 	ecs_set(world, player, Health, {.health = 100});
 	ecs_set(world, player, Renderable, {.position = {400, 225}, .radius = 20, .colorIndex = COLOR_FOREGROUND});
 	ecs_set(world, player, Velocity, {.velocity ={0, 0}});
@@ -539,6 +668,7 @@ int main(void) {
 		.active = true,
 		.wasActive = false
 	});
+	ecs_set(world, player, Spike, {});
 
 	while (!WindowShouldClose()) {
 		BeginDrawing();
@@ -550,7 +680,7 @@ int main(void) {
 
 		ecs_progress(world, GetFrameTime());
 
-		DrawUI();
+		DrawUI(world);
 
 		EndDrawing();
 	}
