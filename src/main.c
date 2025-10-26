@@ -8,6 +8,7 @@
 #include <raylib.h>
 #include "raymath.h"
 #include "audio.h"
+#include "spatial.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -18,6 +19,10 @@ float SmoothDamp(float current, float target, float smoothTime) {
 }
 
 const int MAX_ENTITIES = 10000;
+
+// Spatial partitioning globals
+Quadtree *g_quadtree = NULL;
+bool g_debug_spatial = false;
 
 typedef enum {
     COLOR_PALETTE_0,
@@ -379,12 +384,6 @@ void EnemyMovementSystem(ecs_iter_t *it) {
 void GlobalPositionUpdateSystem(ecs_iter_t *it) {
     GameState *state = ecs_singleton_get(it->world, GameState);
 
-    ecs_query_t *q = ecs_query(it->world, {
-                               .terms = {
-                               { ecs_id(Renderable) }, { ecs_id(Velocity) },
-                               }
-                               });
-
     // Temporary storage for all entities
     typedef struct {
         ecs_entity_t entity;
@@ -395,6 +394,12 @@ void GlobalPositionUpdateSystem(ecs_iter_t *it) {
     EntityRef entities[MAX_ENTITIES];
     int entityCount = 0;
     int tableCount = 0;
+
+    ecs_query_t *q = ecs_query(it->world, {
+       .terms = {
+       { ecs_id(Renderable) }, { ecs_id(Velocity) },
+       }
+    });
 
     // Collect all entities from all tables
     ecs_iter_t query_it = ecs_query_iter(it->world, q);
@@ -422,6 +427,30 @@ void GlobalPositionUpdateSystem(ecs_iter_t *it) {
     const float worldMinY = screenCenter.y - screenCenter.y / zoom;
     const float worldMaxY = screenCenter.y + screenCenter.y / zoom;
 
+    // Rebuild quadtree for broad-phase collision detection
+    // Quadtree bounds match the zoom-adjusted world space
+    if (g_quadtree == NULL) {
+        AABB world_bounds = {worldMinX, worldMinY, worldMaxX, worldMaxY};
+        g_quadtree = quadtree_create(world_bounds);
+    } else {
+        quadtree_clear(g_quadtree);
+        // Update world bounds in case screen size or zoom changed
+        g_quadtree->world_bounds = (AABB){worldMinX, worldMinY, worldMaxX, worldMaxY};
+        // Also update the root node's bounds to match
+        if (g_quadtree->root) {
+            g_quadtree->root->bounds = (AABB){worldMinX, worldMinY, worldMaxX, worldMaxY};
+        }
+    }
+
+    // Insert all entities into quadtree
+    for (int i = 0; i < entityCount; i++) {
+        AABB entity_bounds = aabb_from_circle(
+            entities[i].renderable->position,
+            entities[i].renderable->radius
+        );
+        quadtree_insert(g_quadtree, i, entity_bounds);
+    }
+
     // Update positions and handle collisions across all tables
     for (int i = 0; i < entityCount; i++) {
         entities[i].renderable->position.x += entities[i].velocity->velocity.x *
@@ -429,8 +458,22 @@ void GlobalPositionUpdateSystem(ecs_iter_t *it) {
         entities[i].renderable->position.y += entities[i].velocity->velocity.y *
                 GetFrameTime();
 
-        // Check collisions with all other entities (cross-table)
-        for (int j = i + 1; j < entityCount; j++) {
+        // Query quadtree for nearby entities (broad-phase)
+        AABB query_bounds = aabb_from_circle(
+            entities[i].renderable->position,
+            entities[i].renderable->radius
+        );
+
+        int nearby_indices[256]; // Max nearby entities to check
+        int nearby_count = quadtree_query(g_quadtree, query_bounds, nearby_indices, 256);
+
+        // Check collisions only with nearby entities (narrow-phase)
+        for (int k = 0; k < nearby_count; k++) {
+            int j = nearby_indices[k];
+
+            // Skip self and already-checked pairs
+            if (j <= i) continue;
+
             Vector2 dir = {
                 .x = entities[j].renderable->position.x - entities[i].renderable->position.x,
                 .y = entities[j].renderable->position.y - entities[i].renderable->position.y
@@ -673,12 +716,12 @@ void DrawBackgroundGrid(ecs_world_t *world) {
     gridColor.a = 30;
 
     // Calculate how many grid lines we need based on unscaled spacing
-    int countX = (int)(screenWidth / (gridSpacing * zoom)) + 2;
-    int countY = (int)(screenHeight / (gridSpacing * zoom)) + 2;
+    int countX = (int) (screenWidth / (gridSpacing * zoom)) + 2;
+    int countY = (int) (screenHeight / (gridSpacing * zoom)) + 2;
 
     // Draw grid dots
-    for (int i = -countX/2; i <= countX/2; i++) {
-        for (int j = -countY/2; j <= countY/2; j++) {
+    for (int i = -countX / 2; i <= countX / 2; i++) {
+        for (int j = -countY / 2; j <= countY / 2; j++) {
             // Offset in world space (not screen space)
             Vector2 offset = {i * gridSpacing, j * gridSpacing};
 
@@ -689,7 +732,7 @@ void DrawBackgroundGrid(ecs_world_t *world) {
             // Only draw if on screen
             if (screenPos.x >= 0 && screenPos.x < screenWidth &&
                 screenPos.y >= 0 && screenPos.y < screenHeight) {
-                DrawCircle((int)screenPos.x, (int)screenPos.y, 2.0f, gridColor);
+                DrawCircle((int) screenPos.x, (int) screenPos.y, 2.0f, gridColor);
             }
         }
     }
@@ -771,12 +814,17 @@ void HandleInput(ecs_world_t *world) {
         GameState *state = ecs_singleton_get_mut(world, GameState);
         state->physics = (state->physics + 1) % PHYSICS_COUNT;
     }
+
+    if (IsKeyPressed(KEY_D)) {
+        g_debug_spatial = !g_debug_spatial;
+        printf("Spatial debug: %s\n", g_debug_spatial ? "ON" : "OFF");
+    }
 }
 
 int main(void) {
     SetConfigFlags(FLAG_WINDOW_HIGHDPI); // Enable high DPI support
     InitWindow(1280, 720, "raylib window");
-    SetTargetFPS(120);
+    // SetTargetFPS(120);
     InitAudio();
 
     // Setup themes
@@ -822,14 +870,15 @@ int main(void) {
     ecs_set_name(world, player, "Player"); // {}
     ecs_set(world, player, Health, {.health = 100});
     ecs_set(world, player, Renderable, {
-        .position = {GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f},
-        .radius = 20,
-        .colorIndex = COLOR_FOREGROUND
-    });
+            .position = {GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f},
+            .radius = 20,
+            .colorIndex = COLOR_FOREGROUND
+            });
     ecs_set(world, player, Velocity, {.velocity ={0, 0}});
     ecs_set(world, player, PlayerInput, {});
     ecs_set(world, player, AttractionRangeVFX, {
-            .range = (float)MIN(GetScreenWidth(), GetScreenHeight()) / 2, // Match MAX_ATTRACTION_RANGE from EnemyMovementSystem
+            .range = (float)MIN(GetScreenWidth(), GetScreenHeight()) / 2,
+            // Match MAX_ATTRACTION_RANGE from EnemyMovementSystem
             .currentRange = 0,
             .targetRange = 0,
             .velocity = 0,
@@ -853,9 +902,23 @@ int main(void) {
 
         ecs_progress(world, GetFrameTime());
 
+        // Draw spatial partitioning debug visualization
+        if (g_debug_spatial && g_quadtree) {
+            GameState *state = ecs_singleton_get(world, GameState);
+            Vector2 screenCenter = {GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f};
+            // Pass screen center as camera offset so debug viz uses same transform as entities
+            quadtree_debug_draw(g_quadtree, screenCenter, state->zoom);
+        }
+
         DrawUI(world);
 
         EndDrawing();
+    }
+
+    // Cleanup spatial partitioning
+    if (g_quadtree) {
+        quadtree_destroy(g_quadtree);
+        g_quadtree = NULL;
     }
 
     ecs_fini(world);

@@ -70,7 +70,8 @@ endif()
 
 # Main application executable
 add_executable(c_test src/main.c
-        src/audio.c)
+        src/audio.c
+        src/spatial.c)
 
 # Link libraries
 target_link_libraries(c_test PRIVATE flecs::flecs_static)
